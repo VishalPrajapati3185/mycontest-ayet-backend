@@ -1,27 +1,51 @@
 
 const express = require("express");
+const admin = require("firebase-admin");
 
 const app = express();
-
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Server health check
-app.get("/", (req, res) => {
-  res.status(200).send("MyContest ayeT Backend is running");
+// Firebase Admin connection
+if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  throw new Error("Firebase service account is missing");
+}
+
+const serviceAccount = JSON.parse(
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
 });
 
-// ayeT Studios callback endpoint
+const db = admin.firestore();
+
+// Backend health check
+app.get("/", (req, res) => {
+  res.status(200).send("MyContest Backend is running");
+});
+
+// Firebase connection check
+app.get("/firebase-check", async (req, res) => {
+  try {
+    await db.collection("_backend_health").limit(1).get();
+    res.status(200).json({
+      success: true,
+      message: "Firebase connected successfully",
+    });
+  } catch (error) {
+    console.error("Firebase check failed:", error.message);
+    res.status(500).json({ success: false });
+  }
+});
+
+// ayet Studios callback - verification pending
 app.post("/ayet/callback", async (req, res) => {
-  console.log("ayeT callback received");
-
-  // Reward verification will be added
-  // after confirming ayeT callback documentation.
-
-  return res.status(501).json({
+  res.status(501).json({
     success: false,
-    message: "Callback verification not configured yet"
+    message: "Callback verification is not configured yet",
   });
 });
 
