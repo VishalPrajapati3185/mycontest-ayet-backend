@@ -8,9 +8,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const AYET_API_KEY = process.env.AYET_PUBLISHER_API_KEY;
-const POINTS_MULTIPLIER = Number(
-  process.env.AYET_POINTS_MULTIPLIER || 1
-);
+
+const EXPECTED_ADSLOT_ID = "31290";
+const EXPECTED_PACKAGE = "com.vishal.mycontest";
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   throw new Error("Firebase service account is missing");
@@ -18,10 +18,6 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 
 if (!AYET_API_KEY) {
   throw new Error("AYET_PUBLISHER_API_KEY is missing");
-}
-
-if (!Number.isFinite(POINTS_MULTIPLIER) || POINTS_MULTIPLIER <= 0) {
-  throw new Error("Invalid AYET_POINTS_MULTIPLIER");
 }
 
 const serviceAccount = JSON.parse(
@@ -33,6 +29,7 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
 
 // --------------------------------
 // HEALTH CHECK
@@ -73,6 +70,7 @@ app.post("/offerwall/user-id", async (req, res) => {
     }
 
     const token = authHeader.substring(7);
+
     const decoded = await admin.auth().verifyIdToken(token);
     const uid = decoded.uid;
 
@@ -83,19 +81,30 @@ app.post("/offerwall/user-id", async (req, res) => {
         const snapshot = await transaction.get(offerwallRef);
 
         if (snapshot.exists) {
-          return snapshot.get("offerwallUserId");
+          const existingId = snapshot.get("offerwallUserId");
+
+          if (existingId) {
+            return existingId;
+          }
         }
 
         const newId =
           "MCW" + crypto.randomBytes(18).toString("hex");
 
-        transaction.set(offerwallRef, {
-          offerwallUserId: newId,
-          totalPoints: 0,
-          totalEarned: 0,
-          totalReversed: 0,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        transaction.set(
+          offerwallRef,
+          {
+            offerwallUserId: newId,
+            totalPoints: 0,
+            totalEarnedPoints: 0,
+            totalReversedPoints: 0,
+            totalRevenueUsd: 0,
+            totalReversedUsd: 0,
+            netRevenueUsd: 0,
+            createdAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
 
         return newId;
       }
@@ -117,7 +126,7 @@ app.post("/offerwall/user-id", async (req, res) => {
 });
 
 // --------------------------------
-// AYET SIGNATURE VERIFICATION
+// HMAC SECURITY VERIFICATION
 // --------------------------------
 
 function verifyAyetSignature(req) {
@@ -131,15 +140,27 @@ function verifyAyetSignature(req) {
   const queryString = req.originalUrl.split("?")[1] || "";
   const params = new URLSearchParams(queryString);
 
-  const sortedParams = new URLSearchParams(
-    [...params.entries()].sort(([a], [b]) =>
-      a.localeCompare(b)
-    )
-  );
+  // Duplicate parameter names are not accepted.
+  const entries = [...params.entries()];
+  const names = entries.map(([key]) => key);
+
+  if (new Set(names).size !== names.length) {
+    return false;
+  }
+
+  // Alphabetically sort all callback parameters.
+  entries.sort(([a], [b]) => {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  });
+
+  const sortedQueryString =
+    new URLSearchParams(entries).toString();
 
   const calculatedHash = crypto
     .createHmac("sha256", AYET_API_KEY)
-    .update(sortedParams.toString())
+    .update(sortedQueryString)
     .digest("hex");
 
   const received = Buffer.from(receivedHash, "hex");
@@ -152,7 +173,7 @@ function verifyAyetSignature(req) {
 }
 
 // --------------------------------
-// TRANSACTION DOCUMENT ID
+// HELPERS
 // --------------------------------
 
 function makeTransactionId(provider, transactionId) {
@@ -162,16 +183,43 @@ function makeTransactionId(provider, transactionId) {
     .digest("hex");
 }
 
+function parseUsdCents(value) {
+  if (!/^-?\d+(\.\d{1,2})?$/.test(String(value))) {
+    return null;
+  }
+
+  const negative = String(value).startsWith("-");
+  const clean = String(value).replace("-", "");
+  const parts = clean.split(".");
+
+  const whole = Number(parts[0]);
+  const decimal = Number(
+    (parts[1] || "").padEnd(2, "0")
+  );
+
+  const cents = whole * 100 + decimal;
+
+  if (!Number.isSafeInteger(cents)) {
+    return null;
+  }
+
+  return negative ? -cents : cents;
+}
+
+function centsToUsd(cents) {
+  return Number((cents / 100).toFixed(2));
+}
+
 // --------------------------------
 // AYET CALLBACK
 // --------------------------------
 
 app.get("/ayet/callback", async (req, res) => {
   try {
-    // Verify callback signature first.
+    // 1. Verify HMAC first.
     if (!verifyAyetSignature(req)) {
-      console.warn("Invalid ayeT security hash");
-      return res.status(200).send("invalid signature");
+      console.warn("Invalid ayeT signature");
+      return res.status(403).send("Invalid signature");
     }
 
     const data = req.query;
@@ -179,62 +227,100 @@ app.get("/ayet/callback", async (req, res) => {
     const callbackType = String(data.callback_type || "");
     const transactionId = String(data.transaction_id || "");
     const externalId = String(data.external_identifier || "");
+
     const currencyAmount = Number(data.currency_amount);
+    const payoutCents = parseUsdCents(data.payout_usd);
 
     const offerName = String(data.offer_name || "");
     const offerId = String(data.offer_id || "");
-    const payoutUsd = Number(data.payout_usd || 0);
+    const placementId = String(data.placement_identifier || "");
+    const adslotId = String(data.adslot_id || "");
 
     const isChargeback =
-      callbackType === "chargeback" ||
-      String(data.is_chargeback || "") === "1";
+      String(data.is_chargeback || "") === "1" ||
+      callbackType === "chargeback";
 
-    // Ignore non-paid optional callbacks.
+    // 2. Ignore non-paid callback types.
     if (
       callbackType &&
       callbackType !== "conversion" &&
       callbackType !== "chargeback"
     ) {
-      return res.status(200).send("ignored");
+      return res.status(200).send("Ignored");
     }
 
+    // 3. Validate callback data.
     if (
       !transactionId ||
       !externalId ||
       transactionId.length > 200 ||
       externalId.length > 200 ||
       !Number.isFinite(currencyAmount) ||
-      currencyAmount === 0
+      currencyAmount === 0 ||
+      payoutCents === null ||
+      payoutCents === 0
     ) {
-      return res.status(200).send("invalid parameters");
+      return res.status(400).send("Invalid parameters");
     }
 
-    // Validate conversion / reversal amount.
     if (
-      (!isChargeback && currencyAmount < 0) ||
-      (isChargeback && currencyAmount > 0)
+      (!isChargeback &&
+        (currencyAmount < 0 || payoutCents < 0)) ||
+      (isChargeback &&
+        (currencyAmount > 0 || payoutCents > 0))
     ) {
-      return res.status(200).send("invalid amount");
+      return res.status(400).send("Invalid amount");
     }
 
-    const points = Math.round(
-      currencyAmount * POINTS_MULTIPLIER
-    );
-
-    if (!Number.isSafeInteger(points) || points === 0) {
-      return res.status(200).send("invalid points");
+    // 4. Verify chargeback transaction ID format.
+    if (
+      isChargeback &&
+      !transactionId.startsWith("r-")
+    ) {
+      return res.status(400).send("Invalid reversal ID");
     }
 
-    // Find user ONLY inside offerwall collection.
+    if (
+      !isChargeback &&
+      transactionId.startsWith("r-")
+    ) {
+      return res.status(400).send("Invalid conversion ID");
+    }
+
+    // 5. Verify AdSlot.
+    if (
+      adslotId &&
+      adslotId !== EXPECTED_ADSLOT_ID
+    ) {
+      return res.status(400).send("Invalid AdSlot");
+    }
+
+    // 6. Validate integer user points.
+    const absolutePoints = Math.abs(currencyAmount);
+
+    if (
+      !Number.isSafeInteger(absolutePoints) ||
+      absolutePoints <= 0
+    ) {
+      return res.status(400).send("Invalid points");
+    }
+
+    // The AdSlot conversion rate already calculates
+    // the user's 50% reward. Do not divide again.
+    const points = isChargeback
+      ? -absolutePoints
+      : absolutePoints;
+
+    // 7. Find Offerwall user by external_identifier.
     const userQuery = await db
       .collection("offerwall")
       .where("offerwallUserId", "==", externalId)
       .limit(2)
       .get();
 
-    if (userQuery.empty || userQuery.size !== 1) {
-      console.warn("Unknown or duplicate Offerwall ID");
-      return res.status(200).send("unknown user");
+    if (userQuery.size !== 1) {
+      console.warn("Unknown Offerwall ID");
+      return res.status(200).send("Unknown user");
     }
 
     const offerwallRef = userQuery.docs[0].ref;
@@ -243,99 +329,142 @@ app.get("/ayet/callback", async (req, res) => {
     const transactionsRef =
       offerwallRef.collection("transactions");
 
-    const transactionDocId = makeTransactionId(
+    // 8. Get original transaction ID.
+    const originalTransactionId = isChargeback
+      ? transactionId.substring(2)
+      : transactionId;
+
+    if (!originalTransactionId) {
+      return res.status(400).send("Invalid original ID");
+    }
+
+    const currentDocId = makeTransactionId(
       "ayet",
       transactionId
     );
 
-    const transactionRef =
-      transactionsRef.doc(transactionDocId);
-
-    // ayeT reversal transaction IDs start with r-.
-    const originalTransactionId = isChargeback
-      ? transactionId.replace(/^r-/, "")
-      : transactionId;
-
-    const originalRef = transactionsRef.doc(
-      makeTransactionId("ayet", originalTransactionId)
+    const originalDocId = makeTransactionId(
+      "ayet",
+      originalTransactionId
     );
 
-    const reversalRef = transactionsRef.doc(
-      makeTransactionId("ayet", "r-" + originalTransactionId)
+    const reversalDocId = makeTransactionId(
+      "ayet",
+      "r-" + originalTransactionId
     );
 
+    const currentRef = transactionsRef.doc(currentDocId);
+    const originalRef = transactionsRef.doc(originalDocId);
+    const reversalRef = transactionsRef.doc(reversalDocId);
+
+    const revenueUsd = Math.abs(payoutCents);
+
+    // 9. Atomic transaction.
     await db.runTransaction(async (transaction) => {
-      const currentSnapshot = await transaction.get(transactionRef);
+      const currentSnapshot =
+        await transaction.get(currentRef);
 
-      // Duplicate callback protection.
       if (currentSnapshot.exists) {
         return;
       }
 
-      const userSnapshot = await transaction.get(offerwallRef);
+      const userSnapshot =
+        await transaction.get(offerwallRef);
 
       if (!userSnapshot.exists) {
         throw new Error("OFFERWALL_USER_NOT_FOUND");
       }
 
       if (isChargeback) {
-        const originalSnapshot = await transaction.get(originalRef);
+        const originalSnapshot =
+          await transaction.get(originalRef);
 
-        // Record reversal even if original callback has not arrived yet.
-        transaction.create(transactionRef, {
+        // Record reversal even if original arrives later.
+        transaction.create(currentRef, {
           userId: uid,
           provider: "ayet",
           transactionId,
           originalTransactionId,
-          offerName,
           offerId,
+          offerName,
+          placementId,
+          adslotId,
           currencyAmount,
+          payoutUsd: centsToUsd(-revenueUsd),
           points: 0,
-          payoutUsd,
           status: originalSnapshot.exists
             ? "reversed"
             : "reversal_pending",
           callbackType: "chargeback",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
 
         if (
           originalSnapshot.exists &&
           originalSnapshot.get("status") === "credited"
         ) {
+          const originalPoints =
+            originalSnapshot.get("points");
+
+          const originalPayoutCents =
+            parseUsdCents(
+              String(originalSnapshot.get("payoutUsd"))
+            );
+
+          if (
+            !Number.isSafeInteger(originalPoints) ||
+            originalPoints <= 0 ||
+            originalPayoutCents === null
+          ) {
+            throw new Error("INVALID_ORIGINAL_TRANSACTION");
+          }
+
           transaction.update(originalRef, {
             status: "reversed",
-            reversedAt:
-              admin.firestore.FieldValue.serverTimestamp(),
+            reversedAt: FieldValue.serverTimestamp(),
           });
 
           transaction.update(offerwallRef, {
             totalPoints:
-              admin.firestore.FieldValue.increment(points),
-            totalReversed:
-              admin.firestore.FieldValue.increment(Math.abs(points)),
+              FieldValue.increment(-originalPoints),
+
+            totalReversedPoints:
+              FieldValue.increment(originalPoints),
+
+            totalReversedUsd:
+              FieldValue.increment(
+                centsToUsd(originalPayoutCents)
+              ),
+
+            netRevenueUsd:
+              FieldValue.increment(
+                centsToUsd(-originalPayoutCents)
+              ),
           });
         }
 
         return;
       }
 
-      // If reversal arrived first, do not credit the conversion.
-      const reversalSnapshot = await transaction.get(reversalRef);
+      // Conversion arrives after a reversal.
+      const reversalSnapshot =
+        await transaction.get(reversalRef);
 
       if (reversalSnapshot.exists) {
-        transaction.create(transactionRef, {
+        transaction.create(currentRef, {
           userId: uid,
           provider: "ayet",
           transactionId,
-          offerName,
           offerId,
+          offerName,
+          placementId,
+          adslotId,
           currencyAmount,
+          payoutUsd: centsToUsd(revenueUsd),
           points: 0,
-          payoutUsd,
           status: "reversed",
           callbackType: "conversion",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
         });
 
         transaction.update(reversalRef, {
@@ -346,29 +475,42 @@ app.get("/ayet/callback", async (req, res) => {
       }
 
       // Normal conversion.
-      transaction.create(transactionRef, {
+      transaction.create(currentRef, {
         userId: uid,
         provider: "ayet",
         transactionId,
-        offerName,
         offerId,
+        offerName,
+        placementId,
+        adslotId,
         currencyAmount,
+        payoutUsd: centsToUsd(revenueUsd),
         points,
-        payoutUsd,
         status: "credited",
         callbackType: "conversion",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
       });
 
       transaction.update(offerwallRef, {
-        totalPoints:
-          admin.firestore.FieldValue.increment(points),
-        totalEarned:
-          admin.firestore.FieldValue.increment(points),
+        totalPoints: FieldValue.increment(points),
+
+        totalEarnedPoints:
+          FieldValue.increment(points),
+
+        totalRevenueUsd:
+          FieldValue.increment(centsToUsd(revenueUsd)),
+
+        netRevenueUsd:
+          FieldValue.increment(centsToUsd(revenueUsd)),
+
+        lastUpdated: FieldValue.serverTimestamp(),
       });
     });
 
-    console.log("ayeT callback completed:", transactionId);
+    console.log(
+      "ayeT callback processed:",
+      transactionId
+    );
 
     return res.status(200).send("success");
 
@@ -376,10 +518,10 @@ app.get("/ayet/callback", async (req, res) => {
     console.error("ayeT callback error:", error.message);
 
     if (error.message === "OFFERWALL_USER_NOT_FOUND") {
-      return res.status(200).send("unknown user");
+      return res.status(200).send("Unknown user");
     }
 
-    return res.status(500).send("server error");
+    return res.status(500).send("Server error");
   }
 });
 
@@ -388,5 +530,8 @@ app.get("/ayet/callback", async (req, res) => {
 // --------------------------------
 
 app.listen(PORT, () => {
-  console.log(`MyContest Backend running on port ${PORT}`);
+  console.log(
+    `MyContest Backend running on port ${PORT}`
+  );
 });
+      
